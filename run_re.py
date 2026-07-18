@@ -62,8 +62,7 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-
-ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig,  AlbertConfig)), ())
+ALL_MODELS = sum((tuple(conf.pretrained_config_archive_map.keys()) for conf in (BertConfig, AlbertConfig)), ())
 
 MODEL_CLASSES = {
     'bertsub': (BertConfig, BertForACEBothOneDropoutSub, BertTokenizer),
@@ -75,12 +74,14 @@ task_rel_labels = {}
 
 task_q_labels = dict()
 
+
 def sset(arr):
-    m=[]
+    m = []
     for i in arr:
         if i not in m:
             m.append(i)
     return m
+
 
 class ACEDataset(Dataset):
     def __init__(self, tokenizer, args=None, evaluate=False, do_test=False, max_pair_length=None):
@@ -119,12 +120,26 @@ class ACEDataset(Dataset):
         self.ner_label_list = ['NIL'] + task_ner_labels[self.args.dataset]
         self.sym_labels = ['NIL']
         self.label_list = ['NIL'] + list(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset])) \
-                          + [x + '-1' for x in list(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset]))]
+                          + [x + '-1' for x in
+                             list(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset]))]
         self.q_label_list = ['NIL'] + list(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset])) \
-                            + [x + '-1' for x in list(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset]))]
+                            + [x + '-1' for x in
+                               list(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset]))]
         self.d = len(sset(task_rel_labels[self.args.dataset] + task_q_labels[self.args.dataset]))
 
         self.global_predicted_ners = {}
+
+        # Few-shot config: track low-resource labels for per-group evaluation
+        self.low_resource_relations = set()
+        self.low_resource_qualifiers = set()
+        if hasattr(args, 'fewshot_config') and args.fewshot_config and os.path.exists(args.fewshot_config):
+            with open(args.fewshot_config, 'r') as _f:
+                _fewshot_cfg = json.load(_f)
+            self.low_resource_relations = set(_fewshot_cfg.get('low_resource_relations', []))
+            self.low_resource_qualifiers = set(_fewshot_cfg.get('low_resource_qualifiers', []))
+            logger.info("Few-shot config loaded: %d low-resource relations, %d low-resource qualifiers",
+                        len(self.low_resource_relations), len(self.low_resource_qualifiers))
+
         self.initialize()
 
     def process_to_hyperrelation(self, data):
@@ -167,6 +182,11 @@ class ACEDataset(Dataset):
         self.ner_tot_recall = 0
         self.tot_recall = 0
         self.q_tot_recall = 0
+        # Few-shot per-group recall counters
+        self.high_resource_tot_recall = 0
+        self.low_resource_tot_recall = 0
+        self.high_resource_q_tot_recall = 0
+        self.low_resource_q_tot_recall = 0
         self.data = []
         self.ner_golden_labels = set([])
         self.golden_labels = set([])
@@ -198,8 +218,16 @@ class ACEDataset(Dataset):
             for sentence_relation in relations:
                 for x in sentence_relation:
                     self.tot_recall += 1
+                    if x[4] in self.low_resource_relations:
+                        self.low_resource_tot_recall += 1
+                    else:
+                        self.high_resource_tot_recall += 1
                     for q in x[5]:
                         self.q_tot_recall += 1
+                        if q[2] in self.low_resource_qualifiers:
+                            self.low_resource_q_tot_recall += 1
+                        else:
+                            self.high_resource_q_tot_recall += 1
 
             sentence_boundaries = [0]
             words = []
@@ -241,10 +269,12 @@ class ACEDataset(Dataset):
                 if sentence_length < max_num_subwords:
                     if left_length < right_length:
                         left_context_length = min(left_length, half_context_length)
-                        right_context_length = min(right_length, max_num_subwords - left_context_length - sentence_length)
+                        right_context_length = min(right_length,
+                                                   max_num_subwords - left_context_length - sentence_length)
                     else:
                         right_context_length = min(right_length, half_context_length)
-                        left_context_length = min(left_length, max_num_subwords - right_context_length - sentence_length)
+                        left_context_length = min(left_length,
+                                                  max_num_subwords - right_context_length - sentence_length)
 
                 doc_offset = doc_sent_start - left_context_length
                 target_tokens = subwords[doc_offset: doc_sent_end + right_context_length]
@@ -257,34 +287,52 @@ class ACEDataset(Dataset):
                 for x in sentence_relations:
                     pos2label[(x[0], x[1], x[2], x[3])] = label_map[x[4]]
                     self.golden_labels.add(((l_idx, n), (x[0], x[1]), (x[2], x[3]), x[4]))
-                    self.golden_labels_withner.add(((l_idx, n), (x[0], x[1], std_entity_labels[(x[0], x[1])]), (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4]))
+                    self.golden_labels_withner.add(((l_idx, n), (x[0], x[1], std_entity_labels[(x[0], x[1])]),
+                                                    (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4]))
                     pos2label[(x[2], x[3], x[1], x[0])] = label_map[x[4] + '-1']
                     self.golden_labels.add(((l_idx, n), (x[2], x[3]), (x[0], x[1]), x[4] + '-1'))
-                    self.golden_labels_withner.add(((l_idx, n), (x[2], x[3], std_entity_labels[(x[2], x[3])]), (x[0], x[1], std_entity_labels[(x[0], x[1])]), x[4] + '-1'))
+                    self.golden_labels_withner.add(((l_idx, n), (x[2], x[3], std_entity_labels[(x[2], x[3])]),
+                                                    (x[0], x[1], std_entity_labels[(x[0], x[1])]), x[4] + '-1'))
                     for q in x[5]:
                         q_pos2label[(x[0], x[1], x[2], x[3], q[0], q[1])] = (label_map[x[4]], q_label_map[q[2]])
                         self.q_golden_labels.add(((l_idx, n), (x[0], x[1]), (x[2], x[3]), x[4], (q[0], q[1]), q[2]))
-                        self.q_golden_labels_withner.add(((l_idx, n), (x[0], x[1], std_entity_labels[(x[0], x[1])]), (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4], (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2]))
+                        self.q_golden_labels_withner.add(((l_idx, n), (x[0], x[1], std_entity_labels[(x[0], x[1])]),
+                                                          (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4],
+                                                          (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2]))
 
                         q_pos2label[(x[2], x[3], x[0], x[1], q[0], q[1])] = (label_map[x[4] + '-1'], q_label_map[q[2]])
-                        self.q_golden_labels.add(((l_idx, n), (x[2], x[3]), (x[0], x[1]), x[4] + '-1', (q[0], q[1]), q[2]))
-                        self.q_golden_labels_withner.add(((l_idx, n), (x[2], x[3], std_entity_labels[(x[2], x[3])]), (x[0], x[1], std_entity_labels[(x[0], x[1])]), x[4] + '-1', (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2]))
+                        self.q_golden_labels.add(
+                            ((l_idx, n), (x[2], x[3]), (x[0], x[1]), x[4] + '-1', (q[0], q[1]), q[2]))
+                        self.q_golden_labels_withner.add(((l_idx, n), (x[2], x[3], std_entity_labels[(x[2], x[3])]),
+                                                          (x[0], x[1], std_entity_labels[(x[0], x[1])]), x[4] + '-1',
+                                                          (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2]))
 
                         q_pos2label[(x[0], x[1], q[0], q[1], x[2], x[3])] = (q_label_map[q[2]], label_map[x[4]])
                         self.q_golden_labels.add(((l_idx, n), (x[0], x[1]), (q[0], q[1]), q[2], (x[2], x[3]), x[4]))
-                        self.q_golden_labels_withner.add(((l_idx, n), (x[0], x[1], std_entity_labels[(x[0], x[1])]), (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2], (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4]))
+                        self.q_golden_labels_withner.add(((l_idx, n), (x[0], x[1], std_entity_labels[(x[0], x[1])]),
+                                                          (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2],
+                                                          (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4]))
 
                         q_pos2label[(x[2], x[3], q[0], q[1], x[0], x[1])] = (q_label_map[q[2]], label_map[x[4] + '-1'])
-                        self.q_golden_labels.add(((l_idx, n), (x[2], x[3]), (q[0], q[1]), q[2], (x[0], x[1]), x[4] + '-1'))
-                        self.q_golden_labels_withner.add(((l_idx, n), (x[2], x[3], std_entity_labels[(x[2], x[3])]), (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2], (x[0], x[1], std_entity_labels[(x[0], x[1])]), x[4] + '-1'))
+                        self.q_golden_labels.add(
+                            ((l_idx, n), (x[2], x[3]), (q[0], q[1]), q[2], (x[0], x[1]), x[4] + '-1'))
+                        self.q_golden_labels_withner.add(((l_idx, n), (x[2], x[3], std_entity_labels[(x[2], x[3])]),
+                                                          (q[0], q[1], std_entity_labels[(q[0], q[1])]), q[2],
+                                                          (x[0], x[1], std_entity_labels[(x[0], x[1])]), x[4] + '-1'))
 
                         q_pos2label[(q[0], q[1], x[0], x[1], x[2], x[3])] = (q_label_map[q[2] + '-1'], label_map[x[4]])
-                        self.q_golden_labels.add(((l_idx, n), (q[0], q[1]), (x[0], x[1]), q[2] + '-1', (x[2], x[3]), x[4]))
-                        self.q_golden_labels_withner.add(((l_idx, n), (q[0], q[1], std_entity_labels[(q[0], q[1])]), (x[0], x[1], std_entity_labels[(x[0], x[1])]), q[2] + '-1', (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4]))
+                        self.q_golden_labels.add(
+                            ((l_idx, n), (q[0], q[1]), (x[0], x[1]), q[2] + '-1', (x[2], x[3]), x[4]))
+                        self.q_golden_labels_withner.add(((l_idx, n), (q[0], q[1], std_entity_labels[(q[0], q[1])]),
+                                                          (x[0], x[1], std_entity_labels[(x[0], x[1])]), q[2] + '-1',
+                                                          (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4]))
 
                         q_pos2label[(q[0], q[1], x[2], x[3], x[0], x[1])] = (label_map[x[4]], q_label_map[q[2] + '-1'])
-                        self.q_golden_labels.add(((l_idx, n), (q[0], q[1]), (x[2], x[3]), x[4], (x[0], x[1]), q[2] + '-1'))
-                        self.q_golden_labels_withner.add(((l_idx, n), (q[0], q[1], std_entity_labels[(q[0], q[1])]), (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4], (x[0], x[1], std_entity_labels[(x[0], x[1])]), q[2] + '-1'))
+                        self.q_golden_labels.add(
+                            ((l_idx, n), (q[0], q[1]), (x[2], x[3]), x[4], (x[0], x[1]), q[2] + '-1'))
+                        self.q_golden_labels_withner.add(((l_idx, n), (q[0], q[1], std_entity_labels[(q[0], q[1])]),
+                                                          (x[2], x[3], std_entity_labels[(x[2], x[3])]), x[4],
+                                                          (x[0], x[1], std_entity_labels[(x[0], x[1])]), q[2] + '-1'))
 
                 entities = list(sentence_ners)
 
@@ -304,7 +352,8 @@ class ACEDataset(Dataset):
                             l_m = '[unused0]'
                             r_m = '[unused1]'
 
-                        sub_tokens = target_tokens[:sub_s] + [l_m] + target_tokens[sub_s:sub_e + 1] + [r_m] + target_tokens[sub_e + 1:]
+                        sub_tokens = target_tokens[:sub_s] + [l_m] + target_tokens[sub_s:sub_e + 1] + [
+                            r_m] + target_tokens[sub_e + 1:]
                         sub_e += 2
                     else:
                         sub_s = len(target_tokens)
@@ -345,7 +394,8 @@ class ACEDataset(Dataset):
 
                         for q_start, q_end, qul_label in sentence_ners:
                             if self.model_type.endswith('nersub'):
-                                if (start == sub[0] and end == sub[1]) or (q_start == sub[0] and q_end == sub[1]) or (q_start == start and q_end == end):
+                                if (start == sub[0] and end == sub[1]) or (q_start == sub[0] and q_end == sub[1]) or (
+                                        q_start == start and q_end == end):
                                     continue
 
                             q_doc_entity_start = token2subword[q_start]
@@ -368,7 +418,8 @@ class ACEDataset(Dataset):
                                 continue
 
                             label = q_pos2label.get((sub[0], sub[1], obj[0], obj[1], q[0], q[1]), (0, 0))
-                            q_cur_ins.append(((left, right, ner_label_map[obj_label]), label[0], obj, (q_left, q_right, ner_label_map[qul_label]), label[1], q))
+                            q_cur_ins.append(((left, right, ner_label_map[obj_label]), label[0], obj,
+                                              (q_left, q_right, ner_label_map[qul_label]), label[1], q))
 
                     maxR = max(maxR, len(cur_ins))
                     q_maxR = max(q_maxR, len(q_cur_ins))
@@ -404,15 +455,21 @@ class ACEDataset(Dataset):
         L = len(input_ids)
         input_ids += [self.tokenizer.pad_token_id] * (self.max_seq_length - len(input_ids))
 
-        attention_mask = torch.zeros((self.max_entity_length + self.max_seq_length, self.max_entity_length + self.max_seq_length), dtype=torch.int64)
+        attention_mask = torch.zeros(
+            (self.max_entity_length + self.max_seq_length, self.max_entity_length + self.max_seq_length),
+            dtype=torch.int64)
         attention_mask[:L, :L] = 1
 
         if self.model_type.startswith('albert'):
-            input_ids = input_ids + [30002] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples']))
-            input_ids = input_ids + [30003] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (self.max_pair_length - len(entry['examples']))
+            input_ids = input_ids + [30002] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (
+                        self.max_pair_length - len(entry['examples']))
+            input_ids = input_ids + [30003] * (len(entry['examples'])) + [self.tokenizer.pad_token_id] * (
+                        self.max_pair_length - len(entry['examples']))
         else:
-            input_ids = input_ids + [3] * (int(np.sqrt(len(entry['examples'])))) + [self.tokenizer.pad_token_id] * (self.max_pair_length - int(np.sqrt(len(entry['examples']))))
-            input_ids = input_ids + [4] * (int(np.sqrt(len(entry['examples'])))) + [self.tokenizer.pad_token_id] * (self.max_pair_length - int(np.sqrt(len(entry['examples']))))
+            input_ids = input_ids + [3] * (int(np.sqrt(len(entry['examples'])))) + [self.tokenizer.pad_token_id] * (
+                        self.max_pair_length - int(np.sqrt(len(entry['examples']))))
+            input_ids = input_ids + [4] * (int(np.sqrt(len(entry['examples'])))) + [self.tokenizer.pad_token_id] * (
+                        self.max_pair_length - int(np.sqrt(len(entry['examples']))))
 
         labels = []
         ner_labels = []
@@ -556,6 +613,7 @@ def set_seed(args):
     if args.n_gpu > 0:
         torch.cuda.manual_seed_all(args.seed)
 
+
 def _rotate_checkpoints(args, checkpoint_prefix, use_mtime=False):
     if not args.save_total_limit:
         return
@@ -590,11 +648,11 @@ def train(args, model, tokenizer):
     if len(args.cuda_device) > 0:
         tb_writer = SummaryWriter(
             "logs/" + args.data_dir[max(args.data_dir.rfind('/'), 0):] + "_re_logs/" + args.output_dir[
-                args.output_dir.rfind('/'):])
+                                                                                       args.output_dir.rfind('/'):])
 
     print("\n===== 模型参数统计 =====")
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    dtype_size = 2 if args.fp16 else 4  
+    dtype_size = 2 if args.fp16 else 4
     param_size_mb = total_params * dtype_size / (1024 ** 2)
 
     print(f"总可训练参数: {total_params:,}")
@@ -614,32 +672,39 @@ def train(args, model, tokenizer):
         t_total = len(train_dataloader) // args.gradient_accumulation_steps * args.num_train_epochs
 
     no_decay = ['bias', 'LayerNorm.weight']
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
-         'weight_decay': args.weight_decay},
-        {'params': [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
-    ]
-   
     base_model_for_optim = model
-    
-    gnn_params = []
-    gnn_param_names = []
-    
+
+    # 收集 GNN 参数名，避免与主模型参数重复
+    gnn_param_ids = set()
     if hasattr(base_model_for_optim, 'gnn_branch_hidden') and base_model_for_optim.gnn_branch_hidden:
         gnn_module = base_model_for_optim.gnn_branch_hidden[0]
-        
+        gnn_param_ids = {id(p) for p in gnn_module.parameters()}
+
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in model.named_parameters()
+                    if not any(nd in n for nd in no_decay) and id(p) not in gnn_param_ids],
+         'weight_decay': args.weight_decay},
+        {'params': [p for n, p in model.named_parameters()
+                    if any(nd in n for nd in no_decay) and id(p) not in gnn_param_ids],
+         'weight_decay': 0.0}
+    ]
+
+    gnn_params = []
+    gnn_param_names = []
+
+    if len(gnn_param_ids) > 0:
         gnn_named = list(gnn_module.named_parameters())
-        if len(gnn_named) > 0:
-            gnn_params = [p for n, p in gnn_named]
-            gnn_param_names = [n for n, p in gnn_named]
-            gnn_group_1 = {'params': [p for n, p in gnn_named if not any(nd in n for nd in no_decay)],
-                           'weight_decay': args.weight_decay, 'lr': getattr(args, 'gnn_learning_rate', args.learning_rate)}
-            gnn_group_2 = {'params': [p for n, p in gnn_named if any(nd in n for nd in no_decay)],
-                           'weight_decay': 0.0, 'lr': getattr(args, 'gnn_learning_rate', args.learning_rate)}
-            optimizer_grouped_parameters.append(gnn_group_1)
-            optimizer_grouped_parameters.append(gnn_group_2)
-            print(f"Added GNN params to optimizer, names sample: {gnn_param_names[:5]}")
-    
+        gnn_params = [p for n, p in gnn_named]
+        gnn_param_names = [n for n, p in gnn_named]
+        gnn_group_1 = {'params': [p for n, p in gnn_named if not any(nd in n for nd in no_decay)],
+                       'weight_decay': args.weight_decay,
+                       'lr': getattr(args, 'gnn_learning_rate', args.learning_rate)}
+        gnn_group_2 = {'params': [p for n, p in gnn_named if any(nd in n for nd in no_decay)],
+                       'weight_decay': 0.0, 'lr': getattr(args, 'gnn_learning_rate', args.learning_rate)}
+        optimizer_grouped_parameters.append(gnn_group_1)
+        optimizer_grouped_parameters.append(gnn_group_2)
+        print(f"Added GNN params to optimizer, names sample: {gnn_param_names[:5]}")
+
     optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate, eps=args.adam_epsilon)
     if args.warmup_steps == -1:
         scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1 * t_total),
@@ -670,10 +735,10 @@ def train(args, model, tokenizer):
     tr_re_loss, logging_re_loss = 0.0, 0.0
     tr_q_ner_loss, logging_q_ner_loss = 0.0, 0.0
     tr_q_re_loss, logging_q_re_loss = 0.0, 0.0
-    logging_cl_loss , tr_cl_loss= 0.0, 0.0
+    logging_cl_loss, tr_cl_loss = 0.0, 0.0
     tr_disc_loss, logging_disc_loss = 0.0, 0.0
 
-    train_history = []  
+    train_history = []
     model.zero_grad()
     train_iterator = trange(int(args.num_train_epochs), desc="Epoch", disable=not len(args.cuda_device) > 0)
     set_seed(args)
@@ -683,10 +748,9 @@ def train(args, model, tokenizer):
     if os.path.exists(os.path.join(args.output_dir, 'experimental_data.json')):
         os.remove(os.path.join(args.output_dir, 'experimental_data.json'))
 
-   
     if os.path.exists(os.path.join(args.output_dir, 'experimental_data_test.json')):
         os.remove(os.path.join(args.output_dir, 'experimental_data_test.json'))
-    
+
     for _ in train_iterator:
 
         if _ == args.num_epoch_stage1:
@@ -708,15 +772,16 @@ def train(args, model, tokenizer):
             else:
                 logger.warning("Best checkpoint not found; continue with current weights.")
             gnn_ckpt_path = os.path.join(args.output_dir, "best_gnn_state_stage_1.pth")
-            if os.path.exists(gnn_ckpt_path) and hasattr(base_model, 'gnn_branch_hidden') and base_model.gnn_branch_hidden:
+            if os.path.exists(gnn_ckpt_path) and hasattr(base_model,
+                                                         'gnn_branch_hidden') and base_model.gnn_branch_hidden:
                 try:
-                      gnn_state = torch.load(gnn_ckpt_path, map_location='cpu')
-                      base_model.gnn_branch_hidden[0].load_state_dict(gnn_state)
-                      logger.info("Loaded GNN state from %s", gnn_ckpt_path)
+                    gnn_state = torch.load(gnn_ckpt_path, map_location='cpu')
+                    base_model.gnn_branch_hidden[0].load_state_dict(gnn_state)
+                    logger.info("Loaded GNN state from %s", gnn_ckpt_path)
                 except Exception as e:
-                      logger.warning("Failed to load gnn state: %s", str(e))
+                    logger.warning("Failed to load gnn state: %s", str(e))
 
-            freeze_modules = ['ner_classifier', 'discriminator']  
+            freeze_modules = ['ner_classifier', 'discriminator']
             frozen_count = 0
             for name, param in base_model.named_parameters():
                 param.requires_grad = True
@@ -726,10 +791,17 @@ def train(args, model, tokenizer):
                         frozen_count += 1
             logger.info("Froze %d parameters matching %s", frozen_count, freeze_modules)
 
-            
             no_decay = ['bias', 'LayerNorm.weight']
+
+            # 收集 GNN 参数 ID，避免与主模型参数重复
+            gnn_ids_stage2 = set()
+            if hasattr(base_model, 'gnn_branch_hidden') and base_model.gnn_branch_hidden:
+                gnn_mod = base_model.gnn_branch_hidden[0]
+                gnn_ids_stage2 = {id(p) for p in gnn_mod.parameters()}
+
             grouped = []
-            main_named = [(n, p) for n, p in base_model.named_parameters() if p.requires_grad]
+            main_named = [(n, p) for n, p in base_model.named_parameters()
+                          if p.requires_grad and id(p) not in gnn_ids_stage2]
             grouped.append({
                 'params': [p for n, p in main_named if not any(nd in n for nd in no_decay)],
                 'weight_decay': args.weight_decay,
@@ -741,7 +813,7 @@ def train(args, model, tokenizer):
                 'lr': args.learning_rate
             })
 
-                if hasattr(base_model, 'gnn_branch_hidden') and base_model.gnn_branch_hidden:
+            if hasattr(base_model, 'gnn_branch_hidden') and base_model.gnn_branch_hidden:
                 gnn_mod = base_model.gnn_branch_hidden[0]
                 gnn_named = [(f'gnn.{n}', p) for n, p in gnn_mod.named_parameters() if p.requires_grad]
                 if len(gnn_named) > 0:
@@ -756,7 +828,7 @@ def train(args, model, tokenizer):
                         'weight_decay': 0.0,
                         'lr': gnn_lr
                     })
-            
+
             seen = set()
             final_groups = []
             for g in grouped:
@@ -775,10 +847,10 @@ def train(args, model, tokenizer):
             remaining_epochs = max(0, args.num_train_epochs - args.num_epoch_stage1)
             t_total_stage2 = max(1, steps_per_epoch * remaining_epochs)
             scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=int(0.1 * t_total_stage2),
-        num_training_steps=t_total_stage2
-    )
+                optimizer,
+                num_warmup_steps=int(0.1 * t_total_stage2),
+                num_training_steps=t_total_stage2
+            )
             if args.fp16:
                 from torch.cuda.amp import GradScaler
                 scaler = GradScaler(enabled=True)
@@ -786,9 +858,9 @@ def train(args, model, tokenizer):
                 scaler = None
 
             model.zero_grad()
-            logger.info("Stage 2 setup complete: optimizer rebuilt, scheduler reset, frozen modules: %s", freeze_modules)
+            logger.info("Stage 2 setup complete: optimizer rebuilt, scheduler reset, frozen modules: %s",
+                        freeze_modules)
             logger.info("-" * 30)
-
 
         epoch += 1
         if args.shuffle and _ > 0:
@@ -819,8 +891,8 @@ def train(args, model, tokenizer):
                 re_loss = outputs[1]
                 ner_loss = outputs[2]
                 q_re_loss = outputs[3]
-                contrast_loss = outputs[4] 
-                disc_loss = outputs[4]
+                contrast_loss = outputs[4]
+                disc_loss = outputs[5]
 
                 if args.n_gpu > 1:
                     loss = loss.mean()
@@ -837,8 +909,28 @@ def train(args, model, tokenizer):
                     contrast_loss = contrast_loss / args.gradient_accumulation_steps
                     disc_loss = disc_loss / args.gradient_accumulation_steps
 
+            ner_entropy = outputs[6]
+
+            if args.n_gpu > 1:
+                ner_entropy = ner_entropy.mean()
+
             if _ < args.num_epoch_stage1:
-                loss += disc_loss * (ner_loss * args.adv_coefficient)
+                base_model = model.module if hasattr(model, 'module') else model
+                num_ner_labels = base_model.num_ner_labels
+                max_entropy = torch.log(torch.tensor(
+                    float(num_ner_labels), device=ner_entropy.device, dtype=ner_entropy.dtype))
+
+                norm_entropy = (ner_entropy / max_entropy).clamp(0.0, 1.0)
+
+                maturity = 1.0 - norm_entropy  
+
+                progress = _ / max(args.num_epoch_stage1, 1)
+
+                adaptive_adv = args.adv_coefficient * (
+                    1.0 + 5.0 * (maturity ** 2) * progress
+                )
+
+                loss += disc_loss * (ner_loss * adaptive_adv)
             else:
                 loss = loss
 
@@ -862,7 +954,7 @@ def train(args, model, tokenizer):
             if contrast_loss > 0:
                 tr_cl_loss += contrast_loss.item()
             if disc_loss > 0:
-                tr_disc_loss += disc_loss.item() 
+                tr_disc_loss += disc_loss.item()
 
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.max_grad_norm > 0:
@@ -907,10 +999,12 @@ def train(args, model, tokenizer):
                                          global_step)
                     logging_q_re_loss = tr_q_re_loss
 
-                    tb_writer.add_scalar('Contrast_loss', (tr_cl_loss - logging_cl_loss) / args.logging_steps, global_step)
+                    tb_writer.add_scalar('Contrast_loss', (tr_cl_loss - logging_cl_loss) / args.logging_steps,
+                                         global_step)
                     logging_cl_loss = tr_cl_loss
 
-                    tb_writer.add_scalar('Disc_loss', (tr_disc_loss - logging_disc_loss) / args.logging_steps, global_step)
+                    tb_writer.add_scalar('Disc_loss', (tr_disc_loss - logging_disc_loss) / args.logging_steps,
+                                         global_step)
                     logging_disc_loss = tr_disc_loss
 
                     hist_path = os.path.join(args.output_dir, 'train_history.json')
@@ -936,7 +1030,6 @@ def train(args, model, tokenizer):
                         results.update(step_information)
                         with open(os.path.join(args.output_dir, 'experimental_data.json'), "a") as f:
                             f.write(json.dumps(results) + '\n')
-
 
                         if f1 > best_f1:
                             best_f1 = f1
@@ -999,11 +1092,12 @@ def train(args, model, tokenizer):
                                     result = evaluate(args, model, tokenizer, prefix=global_step_str,
                                                       do_test=not args.no_test)
                                     if not args.no_test:
-                                       test_log = result.copy()
-                                       test_log['epoch'] = epoch
-                                       test_log['global_step'] = global_step
+                                        test_log = result.copy()
+                                        test_log['epoch'] = epoch
+                                        test_log['global_step'] = global_step
                                     try:
-                                        with open(os.path.join(args.output_dir, 'experimental_data_test.json'), "a") as f_test:
+                                        with open(os.path.join(args.output_dir, 'experimental_data_test.json'),
+                                                  "a") as f_test:
                                             f_test.write(json.dumps(test_log) + '\n')
                                     except Exception as e:
                                         logger.warning("Failed to write test log: %s", str(e))
@@ -1027,12 +1121,14 @@ def train(args, model, tokenizer):
         if args.max_steps > 0 and global_step > args.max_steps:
             train_iterator.close()
             break
+
     try:
         final_hist_path = os.path.join(args.output_dir, 'train_history.json')
         with open(final_hist_path, 'w', encoding='utf-8') as hf:
             json.dump(train_history, hf, ensure_ascii=False, indent=2)
         try:
             import csv
+
             csv_path = os.path.join(args.output_dir, 'train_history.csv')
             if len(train_history) > 0:
                 keys = list(train_history[0].keys())
@@ -1070,6 +1166,27 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     q_golden_labels_withner = set(eval_dataset.q_golden_labels_withner)
     q_label_list = list(eval_dataset.q_label_list)
     q_tot_recall = eval_dataset.q_tot_recall
+
+    # Few-shot per-group evaluation setup
+    low_resource_relations = eval_dataset.low_resource_relations
+    low_resource_qualifiers = eval_dataset.low_resource_qualifiers
+    has_fewshot = bool(low_resource_relations or low_resource_qualifiers)
+
+    # Per-group recall denominators (from dataset)
+    high_resource_tot_recall = eval_dataset.high_resource_tot_recall
+    low_resource_tot_recall = eval_dataset.low_resource_tot_recall
+    high_resource_q_tot_recall = eval_dataset.high_resource_q_tot_recall
+    low_resource_q_tot_recall = eval_dataset.low_resource_q_tot_recall
+
+    def _is_low_resource_rel(label_str):
+        """Check if a relation label (may have -1 suffix) is low-resource."""
+        base = label_str[:-2] if label_str.endswith('-1') else label_str
+        return base in low_resource_relations
+
+    def _is_low_resource_qual(label_str):
+        """Check if a qualifier label (may have -1 suffix) is low-resource."""
+        base = label_str[:-2] if label_str.endswith('-1') else label_str
+        return base in low_resource_qualifiers
 
     if not os.path.exists(eval_output_dir) and len(args.cuda_device) > 0:
         os.makedirs(eval_output_dir)
@@ -1150,6 +1267,10 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
                             logits[i, j, k].tolist(), ner_label, q_logits[i, j, k].tolist(), q_ner_label)
 
     cor, q_cor, tot_pred, tot_pred_r, cor_with_ner, q_cor_with_ner = 0, 0, 0, 0, 0, 0
+    # Few-shot per-group counters for relations
+    h_cor, l_cor, h_tot_pred_r, l_tot_pred_r = 0, 0, 0, 0
+    # Few-shot per-group counters for hyper-relations (qualifier)
+    h_q_cor, l_q_cor, h_tot_pred, l_tot_pred = 0, 0, 0, 0
     global_predicted_ners = eval_dataset.global_predicted_ners
     ner_golden_labels = eval_dataset.ner_golden_labels
     ner_cor, ner_tot_pred, ner_ori_cor = 0, 0, 0
@@ -1318,10 +1439,20 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
             if is_visited_r:
                 tot_pred_r += 1
                 relation_visited.append((example_index, m1, m2, pred_label))
+                if has_fewshot:
+                    if _is_low_resource_rel(pred_label):
+                        l_tot_pred_r += 1
+                    else:
+                        h_tot_pred_r += 1
 
             if is_visited_rq:
                 tot_pred += 1
                 rq_visited.append((example_index, m1, m2, pred_label, m3, q_pred_label))
+                if has_fewshot:
+                    if _is_low_resource_qual(q_pred_label):
+                        l_tot_pred += 1
+                    else:
+                        h_tot_pred += 1
 
             ner_results = list(global_predicted_ners[example_index])
             for m in ner_results:
@@ -1332,11 +1463,21 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
             if is_visited_r and (example_index, m1, m2, pred_label) in golden_labels:
                 cor += 1
+                if has_fewshot:
+                    if _is_low_resource_rel(pred_label):
+                        l_cor += 1
+                    else:
+                        h_cor += 1
             if is_visited_r and (example_index, (m1[0], m1[1], pos2ner[m1]), (m2[0], m2[1], pos2ner[m2]),
                                  pred_label) in golden_labels_withner:
                 cor_with_ner += 1
             if is_visited_rq and (example_index, m1, m2, pred_label, m3, q_pred_label) in q_golden_labels:
                 q_cor += 1
+                if has_fewshot:
+                    if _is_low_resource_qual(q_pred_label):
+                        l_q_cor += 1
+                    else:
+                        h_q_cor += 1
             if is_visited_rq and (example_index, (m1[0], m1[1], pos2ner[m1]), (m2[0], m2[1], pos2ner[m2]), pred_label,
                                   (m3[0], m3[1], q_pos2ner[m3]), q_pred_label) in q_golden_labels_withner:
                 q_cor_with_ner += 1
@@ -1406,7 +1547,36 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
     q_r_with_ner = q_cor_with_ner / q_tot_recall
     q_f1_with_ner = 2 * (q_p_with_ner * q_r_with_ner) / (q_p_with_ner + q_r_with_ner) if q_cor_with_ner > 0 else 0.0
 
+    # Few-shot per-group metrics
     results = {'f1': f1, 'f1_with_ner': f1_with_ner, 'q_f1': q_f1, 'q_f1_with_ner': q_f1_with_ner, 'ner_f1': ner_f1}
+
+    if has_fewshot:
+        # High-resource relation metrics
+        h_p = h_cor / h_tot_pred_r if h_tot_pred_r > 0 else 0
+        h_r = h_cor / high_resource_tot_recall if high_resource_tot_recall > 0 else 0
+        h_f1 = 2 * (h_p * h_r) / (h_p + h_r) if h_cor > 0 else 0.0
+        # Low-resource relation metrics
+        l_p = l_cor / l_tot_pred_r if l_tot_pred_r > 0 else 0
+        l_r = l_cor / low_resource_tot_recall if low_resource_tot_recall > 0 else 0
+        l_f1 = 2 * (l_p * l_r) / (l_p + l_r) if l_cor > 0 else 0.0
+        # High-resource qualifier metrics
+        h_q_p = h_q_cor / h_tot_pred if h_tot_pred > 0 else 0
+        h_q_r = h_q_cor / high_resource_q_tot_recall if high_resource_q_tot_recall > 0 else 0
+        h_q_f1 = 2 * (h_q_p * h_q_r) / (h_q_p + h_q_r) if h_q_cor > 0 else 0.0
+        # Low-resource qualifier metrics
+        l_q_p = l_q_cor / l_tot_pred if l_tot_pred > 0 else 0
+        l_q_r = l_q_cor / low_resource_q_tot_recall if low_resource_q_tot_recall > 0 else 0
+        l_q_f1 = 2 * (l_q_p * l_q_r) / (l_q_p + l_q_r) if l_q_cor > 0 else 0.0
+
+        results.update({
+            'h_f1': h_f1, 'h_p': h_p, 'h_r': h_r,
+            'l_f1': l_f1, 'l_p': l_p, 'l_r': l_r,
+            'h_q_f1': h_q_f1, 'h_q_p': h_q_p, 'h_q_r': h_q_r,
+            'l_q_f1': l_q_f1, 'l_q_p': l_q_p, 'l_q_r': l_q_r,
+        })
+        logger.info("Few-shot Result (High-resource): h_f1=%.4f, h_q_f1=%.4f", h_f1, h_q_f1)
+        logger.info("Few-shot Result (Low-resource):  l_f1=%.4f, l_q_f1=%.4f", l_f1, l_q_f1)
+
     logger.info("Result: %s", json.dumps(results))
 
     results_p = {'p': p, 'p_with_ner': p_with_ner, 'q_p': q_p, 'q_p_with_ner': q_p_with_ner, 'ner_p': ner_p}
@@ -1419,6 +1589,14 @@ def evaluate(args, model, tokenizer, prefix="", do_test=False):
 
     results_num = {'correct_r': cor, 'num_r_ans': tot_recall, 'num_r_pred': tot_pred_r, 'correct_q': q_cor,
                    'num_q_ans': q_tot_recall, 'num_q_pred': tot_pred}
+    # Add per-group counts
+    if has_fewshot:
+        results_num.update({
+            'h_correct_r': h_cor, 'h_num_r_ans': high_resource_tot_recall, 'h_num_r_pred': h_tot_pred_r,
+            'l_correct_r': l_cor, 'l_num_r_ans': low_resource_tot_recall, 'l_num_r_pred': l_tot_pred_r,
+            'h_correct_q': h_q_cor, 'h_num_q_ans': high_resource_q_tot_recall, 'h_num_q_pred': h_tot_pred,
+            'l_correct_q': l_q_cor, 'l_num_q_ans': low_resource_q_tot_recall, 'l_num_q_pred': l_tot_pred,
+        })
     results.update(results_num)
     logger.info("Result: %s", json.dumps(results_num))
 
@@ -1442,7 +1620,7 @@ def to_gran_format(result_file, label_file, output_file):
             num_sens = len(test_dict["relations"])
             res_dict[str(i)] = []
             for k in range(num_sens):
-                res_dict[str(i)].append([k,[]])
+                res_dict[str(i)].append([k, []])
     for i in range(0, test_lines.__len__()):
         hypers = []
         # res_set.append([])
@@ -1470,6 +1648,7 @@ def to_gran_format(result_file, label_file, output_file):
         res_set.append(hypers)
     return res_set
 
+
 def compaction(res_set, result_comp_file):
     if os.path.exists(result_comp_file):
         os.remove(result_comp_file)
@@ -1488,15 +1667,15 @@ def compaction(res_set, result_comp_file):
                 hy_map[rso] = [res_dict]
         for rso, ds in hy_map.items():
             t_d = {"N": 0}
-            ext=0
+            ext = 0
             for d in ds:
                 for k, v in d.items():
-                    if k in t_d.keys() and k!="relation" and k!="subject"and k!="object"and k!="N":
-                        t_d[k]+=v
-                        ext+=1
+                    if k in t_d.keys() and k != "relation" and k != "subject" and k != "object" and k != "N":
+                        t_d[k] += v
+                        ext += 1
                     else:
-                        t_d[k]=v
-            t_d["N"] = t_d.__len__() - 2 +ext
+                        t_d[k] = v
+            t_d["N"] = t_d.__len__() - 2 + ext
             res_comp_line.append(json.dumps(t_d))
         res_table.append(res_comp_line)
         formal_res_comp_line = []
@@ -1504,6 +1683,7 @@ def compaction(res_set, result_comp_file):
             formal_res_comp_line.append(hyper_relation + "\n")
         resf_comp.writelines(formal_res_comp_line)
     return res_table
+
 
 def statistic(res_table, test_file):
     testf = open(test_file, "r")
@@ -1534,17 +1714,17 @@ def statistic(res_table, test_file):
                 obj = obj + sentence[index] + " "
             obj = obj + sentence[label_relation[3]]
             text_label_relation["object"] = obj
-            ext=0
+            ext = 0
             for att_pair in label_relation[5]:
                 for index in range(att_pair[0], att_pair[1]):
                     att = att + sentence[index] + " "
                 att = att + sentence[att_pair[1]]
                 if att_pair[2] in text_label_relation.keys():
                     text_label_relation[att_pair[2]] += [att]
-                    ext+=1
+                    ext += 1
                 else:
                     text_label_relation[att_pair[2]] = [att]
-            text_label_relation["N"] = text_label_relation.__len__() - 2 +ext
+            text_label_relation["N"] = text_label_relation.__len__() - 2 + ext
             num_label += 1
             text_label_relations.append(json.dumps(text_label_relation))
 
@@ -1578,8 +1758,8 @@ def statistic(res_table, test_file):
     print("f1_comp = " + f1.__str__())
     print("N_of_pred_comp = " + N_of_result.__str__())
     print("N_of_ans_comp = " + N_of_test.__str__())
-    return {"p_comp": p, "r_comp": r, "f1_comp": f1, "N_of_pred_comp": N_of_result, "N_of_ans_comp": N_of_test, "num_ans_comp": num_label, "num_pred_comp": num_result, "correct_comp": match}
-
+    return {"p_comp": p, "r_comp": r, "f1_comp": f1, "N_of_pred_comp": N_of_result, "N_of_ans_comp": N_of_test,
+            "num_ans_comp": num_label, "num_pred_comp": num_result, "correct_comp": match}
 
 
 def main():
@@ -1590,7 +1770,7 @@ def main():
     parser.add_argument("--dataset", default='hyperred_hyperrelation', type=str)
     parser.add_argument("--nary_schema", default="hyperrelation", type=str)
     parser.add_argument("--data_dir", default='datasets/hyperred_processed_data/hyperred_hyperrelation', type=str)
-    parser.add_argument("--output_dir", default="result_module2/wendu05", type=str)
+    parser.add_argument("--output_dir", default="model_output/train_change/A", type=str)
     parser.add_argument("--num_train_epochs", default=10.0, type=float)
     ##################################################################################################
     # select-cuda
@@ -1708,7 +1888,9 @@ def main():
     parser.add_argument("--num_epoch_stage1", default=3, type=int,
                         help="Number of epochs for the adversarial multi-task stage.")
     parser.add_argument("--adv_coefficient", default=0.1, type=float,
-                    help="Coefficient for the adversarial loss term.")
+                        help="Coefficient for the adversarial loss term.")
+    parser.add_argument("--fewshot_config", default=None, type=str,
+                        help="Few-shot config JSON file for per-group (high/low resource) evaluation.")
 
     args = parser.parse_args()
 
@@ -1823,7 +2005,6 @@ def main():
 
     model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
                                         config=config)
-
 
     # check vocab_id of subject, object, [MASK]
     if args.do_train:
@@ -1944,4 +2125,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
