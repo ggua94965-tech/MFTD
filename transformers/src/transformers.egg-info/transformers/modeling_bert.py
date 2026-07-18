@@ -2224,13 +2224,13 @@ class BertForACEBothOneDropoutSpanSub(BertPreTrainedModel):
 
 from fightingcv_attention.attention.AFT import AFT_FULL
 from fightingcv_attention.attention.MUSEAttention import MUSEAttention
-from .gnn_encoder import GNN_encoder
 from .transformer_model import TransformerModel
-import dgl
 from torch.nn import CrossEntropyLoss
 
 class Contrast(nn.Module):
-    def __init__(self, hidden_dim, tau, lam):
+
+    def __init__(self, hidden_dim, tau, lam, hard_neg_weight=2.0, pos_temperature=1.0):
+        
         super(Contrast, self).__init__()
         self.proj = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -2239,6 +2239,8 @@ class Contrast(nn.Module):
         )
         self.tau = tau
         self.lam = lam
+        self.hard_neg_weight = hard_neg_weight      
+        self.pos_temperature = pos_temperature       
 
     def sim(self, z1, z2):
         z1_norm = torch.norm(z1, dim=-1, keepdim=True)
@@ -2248,23 +2250,83 @@ class Contrast(nn.Module):
         sim_matrix = torch.exp(dot_numerator / (dot_denominator + 1e-8) / self.tau)
         return sim_matrix
 
-    def forward(self, z_mp, z_sc):
+    def forward(self, z_mp, z_sc, ent_len=None):
         z_proj_mp = F.normalize(self.proj(z_mp), dim=-1)
         z_proj_sc = F.normalize(self.proj(z_sc), dim=-1)
 
-        sim_matrix = torch.mm(z_proj_mp, z_proj_sc.t()) / self.tau
+        sim_matrix = torch.mm(z_proj_mp, z_proj_sc.t()) / self.tau  
 
-        log_prob = F.log_softmax(sim_matrix, dim=1)
+        N = z_proj_mp.shape[0]
 
-        bsz = z_proj_mp.shape[0]
-        pos_mask = torch.eye(bsz, device=z_proj_mp.device)
+        if ent_len is not None and ent_len > 1:
+            bsz = N // ent_len
+            device = z_mp.device
 
-        lori_mp = -(log_prob * pos_mask).sum(dim=-1).mean()
+            batch_ids = torch.arange(bsz, device=device).repeat_interleave(ent_len)  
+            same_batch = (batch_ids.unsqueeze(0) == batch_ids.unsqueeze(1)).float() 
+
+            local_pos = torch.arange(ent_len, device=device).repeat(bsz)  
+            pos_dist = torch.abs(local_pos.unsqueeze(0) - local_pos.unsqueeze(1))  
+
+ 
+            role_bonus = self.hard_neg_weight * torch.exp(
+                -pos_dist / self.pos_temperature
+            )
+            eye_mask = torch.eye(N, device=device)
+            role_bonus = role_bonus * same_batch * (1 - eye_mask)
+
+
+            log_bonus = torch.log1p(role_bonus)
+            sim_matrix = sim_matrix + log_bonus
+
+        pos_mask = torch.eye(N, device=z_proj_mp.device)
+
+        log_prob_mp = F.log_softmax(sim_matrix, dim=1)
+        lori_mp = -(log_prob_mp * pos_mask).sum(dim=-1).mean()
 
         log_prob_sc = F.log_softmax(sim_matrix.t(), dim=1)
         lori_sc = -(log_prob_sc * pos_mask).sum(dim=-1).mean()
 
         return self.lam * lori_mp + (1 - self.lam) * lori_sc
+
+
+class ChainGNNLayer(nn.Module):
+
+    def __init__(self, in_feats, out_feats):
+        super().__init__()
+        self.linear = nn.Linear(in_feats, out_feats)
+
+    def forward(self, x):
+        bsz, n, d = x.shape
+
+        out_deg = torch.full((n,), 3.0, device=x.device, dtype=x.dtype)
+        out_deg[0] = 2.0
+        out_deg[-1] = 2.0
+
+        x_norm = x / out_deg.view(1, n, 1)
+
+        x_padded = F.pad(x_norm, (0, 0, 1, 1))  
+
+        x_aggr = x_padded[:, :-2, :] + x_padded[:, 1:-1, :] + x_padded[:, 2:, :]
+
+        return F.relu(self.linear(x_aggr))
+
+
+class ChainGNN(nn.Module):
+
+    def __init__(self, in_feats, hid_feats, out_feats, layer_nums=2):
+        super().__init__()
+        self.layer_nums = layer_nums
+        self.layer1 = ChainGNNLayer(in_feats, hid_feats if layer_nums > 1 else out_feats)
+        if layer_nums > 1:
+            self.layer2 = ChainGNNLayer(hid_feats, out_feats)
+
+    def forward(self, x):
+        x = self.layer1(x)
+        if self.layer_nums > 1:
+            x = self.layer2(x)
+        return x
+
 
 class BertForACEBothOneDropoutSub(BertPreTrainedModel):
     def __init__(self, config):
@@ -2296,23 +2358,20 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
         self.hidden_dim = config.hidden_size * 2
 
-        gnn = GNN_encoder(
+        gnn = ChainGNN(
             in_feats=self.hidden_dim,
             hid_feats=self.hidden_dim,
             out_feats=self.hidden_dim,
-            rel_names=['link'],
-            layer_nums=2,
-            category='mention')
+            layer_nums=2)
 
-        self.gnn_branch_hidden = [gnn]
-        self.gnn_branch_hidden[0].cpu()
+        self.gnn_branch_hidden = nn.ModuleList([gnn])
 
         self.hop_transformer = TransformerModel(
             hops=2,
             n_class=self.num_labels,
             input_dim=self.hidden_dim,
-            pe_dim=0, 
-            n_layers=2, 
+            pe_dim=0,
+            n_layers=2,
             num_heads=8,
             hidden_dim=self.hidden_dim,
             ffn_dim=self.hidden_dim * 2,
@@ -2324,9 +2383,13 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         self.contrast_module = Contrast(
             hidden_dim=self.hidden_dim,
             tau=0.4,
-            lam=0.5
+            lam=0.5,
+            hard_neg_weight=2.0,       
+            pos_temperature=1.0          
         )
-        self.fusion_fc = nn.Linear(self.hidden_dim * 4, self.hidden_dim)
+        self.fusion_fc = nn.Linear(self.hidden_dim * 6, self.hidden_dim)
+        self.enhance_gnn = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.enhance_trans = nn.Linear(self.hidden_dim, self.hidden_dim)
         self.contrast_weight = 0.05
 
         self.discriminator_dropout = nn.Dropout(0.5)
@@ -2334,27 +2397,6 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
         self.fc = nn.Linear(config.hidden_size * 2 * 2, config.hidden_size * 2)
 
-
-    def build_batch_graph(self, bsz, ent_len, adj_matrices=None):
-        if adj_matrices is None:
-            adj = torch.eye(ent_len)
-            for i in range(ent_len):
-                if i > 0: adj[i, i-1] = 1
-                if i < ent_len - 1: adj[i, i+1] = 1
-            adj_matrices = adj.unsqueeze(0).repeat(bsz, 1, 1)
-
-        edges = adj_matrices.nonzero()
-
-        batch_idx = edges[:, 0]
-        src_local = edges[:, 1]
-        dst_local = edges[:, 2]
-
-        offsets = batch_idx * ent_len
-        src = src_local + offsets
-        dst = dst_local + offsets
-
-        g = dgl.heterograph({('mention', 'link', 'mention'): (src, dst)})
-        return g
 
     def forward(
             self,
@@ -2396,32 +2438,22 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
         feature_vector2 = self.posi(feature_vector1)
         feature_vector3 = self.qia(feature_vector1, feature_vector1, feature_vector1)
 
-        curr_bsz, curr_ent_len, _ = feature_vector.shape
-        bg = self.build_batch_graph(curr_bsz, curr_ent_len)
+        z_gnn = self.gnn_branch_hidden[0](feature_vector)
 
-        node_feats_gpu = feature_vector.view(-1, self.hidden_dim)
-        node_feats_cpu = {"mention": node_feats_gpu.cpu().float()}
+        projected_tokens = self.token_proj(hidden_states[:, :self.max_seq_length, :])
 
-        gnn_cpu_module = self.gnn_branch_hidden[0]
-        z_gnn_cpu = gnn_cpu_module(bg, node_feats_cpu) 
-        z_gnn = z_gnn_cpu.to(feature_vector.device).to(feature_vector.dtype)
-        z_gnn = z_gnn.view(bsz, ent_len, self.hidden_dim)
+        hop0 = feature_vector
 
-        seq_len = self.max_seq_length
-        projected_tokens = self.token_proj(hidden_states[:, :seq_len, :]) 
-
-        hop0 = feature_vector 
-
-        cls_proj = self.token_proj(hidden_states[:, 0, :]) 
-        hop1 = cls_proj.unsqueeze(1).expand(-1, ent_len, -1) 
+        cls_proj = self.token_proj(hidden_states[:, 0, :])
+        hop1 = cls_proj.unsqueeze(1).expand(-1, ent_len, -1)
 
         attn_scores = torch.matmul(feature_vector, projected_tokens.transpose(-1, -2))
         attn_scores = attn_scores / (self.hidden_dim ** 0.5)
         attn_probs = torch.softmax(attn_scores, dim=-1)
 
-        hop2 = torch.matmul(attn_probs, projected_tokens) 
+        hop2 = torch.matmul(attn_probs, projected_tokens)
 
-        combined_hops = torch.stack([hop0, hop1, hop2], dim=2) 
+        combined_hops = torch.stack([hop0, hop1, hop2], dim=2)
 
         combined_hops_flat = combined_hops.view(-1, 3, self.hidden_dim)
         z_trans_raw = self.hop_transformer(combined_hops_flat)
@@ -2430,9 +2462,16 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
         flat_gnn = z_gnn.view(-1, self.hidden_dim)
         flat_trans = z_trans.view(-1, self.hidden_dim)
-        contrast_loss = self.contrast_module(flat_trans, flat_gnn)
+        contrast_loss = self.contrast_module(flat_trans, flat_gnn, ent_len=ent_len)
 
-        combined_all = torch.cat([z_gnn, z_trans, feature_vector2, feature_vector3], dim=-1)
+        gnn_enhanced = z_gnn + self.enhance_gnn(z_trans)
+        trans_enhanced = z_trans + self.enhance_trans(z_gnn)
+
+        combined_all = torch.cat([
+            z_gnn, z_trans,             
+            gnn_enhanced, trans_enhanced, 
+            feature_vector2, feature_vector3  
+        ], dim=-1)
         feature_vector = feature_vector + self.fusion_fc(combined_all)
 
 
@@ -2450,13 +2489,13 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
 
 
-        m1_scores = self.re_classifier_m1(m1_states)  
-        m2_scores = self.re_classifier_m2(r_feature_vector)  
+        m1_scores = self.re_classifier_m1(m1_states)
+        m2_scores = self.re_classifier_m2(r_feature_vector)
         m3_scores = self.re_classifier_m3(q_feature_vector)
         re_prediction_scores = m1_scores.unsqueeze(1).unsqueeze(2) + m2_scores + m3_scores
 
-        q_m1_scores = self.q_re_classifier_m1(m1_states)  
-        q_m2_scores = self.q_re_classifier_m2(r_feature_vector) 
+        q_m1_scores = self.q_re_classifier_m1(m1_states)
+        q_m2_scores = self.q_re_classifier_m2(r_feature_vector)
         q_m3_scores = self.q_re_classifier_m3(q_feature_vector)
         q_re_prediction_scores = q_m1_scores.unsqueeze(1).unsqueeze(2) + q_m2_scores + q_m3_scores
 
@@ -2472,9 +2511,9 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
 
             discriminator_logits = self.discriminator(self.discriminator_dropout(feature_vector1))
             ner_probs = F.log_softmax(ner_prediction_scores, dim=-1)
-            ner_preds = torch.argmax(ner_probs, dim=-1) 
+            ner_preds = torch.argmax(ner_probs, dim=-1)
             mask = (ner_labels != -1)
-            comparison_result = (ner_preds == ner_labels).long() 
+            comparison_result = (ner_preds == ner_labels).long()
             active_loss_d = mask.view(-1)
             active_logits_d = discriminator_logits.view(-1, 2)[active_loss_d]
             active_labels_d = comparison_result.view(-1)[active_loss_d]
@@ -2482,8 +2521,15 @@ class BertForACEBothOneDropoutSub(BertPreTrainedModel):
             loss_fct_d = CrossEntropyLoss()
             disc_loss = loss_fct_d(active_logits_d, active_labels_d)
 
+            with torch.no_grad():
+                ner_probs_entropy = F.softmax(ner_prediction_scores, dim=-1)  
+                entropy_per_pos = -(ner_probs_entropy * torch.log(
+                    ner_probs_entropy + 1e-10)).sum(dim=-1)  
+                valid_entropy_mask = (ner_labels != -1).float()
+                ner_entropy = (entropy_per_pos * valid_entropy_mask).sum() / valid_entropy_mask.sum().clamp(min=1)
+
             loss =  re_loss + q_re_loss + self.contrast_weight * contrast_loss
-            outputs = (loss, re_loss, ner_loss, q_re_loss, contrast_loss, disc_loss) + outputs
+            outputs = (loss, re_loss, ner_loss, q_re_loss, contrast_loss, disc_loss, ner_entropy) + outputs
 
         return outputs
 
